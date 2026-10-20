@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "smart-parking",
+    "slug": "smart-parking",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE"
+      }
+    }
+  }
+}
