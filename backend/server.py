@@ -1,111 +1,129 @@
+"""Parking prototype API. Camera detection is explicitly opt-in."""
+
+from contextlib import asynccontextmanager
+import logging
+import os
+from pathlib import Path
+import threading
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-import cv2
-import threading
-import time
 
-# -------------------- APP --------------------
-app = FastAPI()
+log = logging.getLogger(__name__)
+DETECTION_ENABLED = os.getenv("PARKING_DETECTION_ENABLED", "0") == "1"
+CAMERA_INDEX = int(os.getenv("PARKING_CAMERA_INDEX", "1"))
+MODEL_PATH = os.getenv("PARKING_MODEL_PATH", str(Path(__file__).with_name("yolov8n.pt")))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -------------------- YOLO MODEL --------------------
-model = YOLO("yolov8n.pt")
-
-# 🔴 CHANGE CAMERA INDEX IF NEEDED
-# 0 = laptop cam
-# 1 / 2 = external webcam
-cap = cv2.VideoCapture(1)
-
-# -------------------- AUTO-GENERATE 58 SLOTS --------------------
-ROWS = 10
-COLS = 6
-SLOT_WIDTH = 90
-SLOT_HEIGHT = 80
-START_X = 40
-START_Y = 100
-GAP_X = 20
-GAP_Y = 20
-
+# Original example geometry: replace these regions with calibrated camera coordinates.
 SLOTS = {}
-count = 1
+for row in range(10):
+    for col in range(6):
+        number = row * 6 + col + 1
+        if number <= 58:
+            x, y = 40 + col * 110, 100 + row * 100
+            SLOTS[f"B{number}"] = (x, y, x + 90, y + 80)
 
-for r in range(ROWS):
-    for c in range(COLS):
-        if count > 58:
-            break
+BIG_LOT_SLOTS = {key: "free" for key in SLOTS}
+state_lock = threading.Lock()
+detector_status = "disabled"
 
-        x1 = START_X + c * (SLOT_WIDTH + GAP_X)
-        y1 = START_Y + r * (SLOT_HEIGHT + GAP_Y)
-        x2 = x1 + SLOT_WIDTH
-        y2 = y1 + SLOT_HEIGHT
 
-        SLOTS[f"B{count}"] = (x1, y1, x2, y2)
-        count += 1
-
-    if count > 58:
-        break
-
-BIG_LOT_SLOTS = {k: "free" for k in SLOTS}
-
-# -------------------- HELPER FUNCTION --------------------
 def overlaps(box, slot):
     bx1, by1, bx2, by2 = box
     sx1, sy1, sx2, sy2 = slot
     return not (bx2 < sx1 or bx1 > sx2 or by2 < sy1 or by1 > sy2)
 
-# -------------------- YOLO DETECTION LOOP --------------------
-def yolo_loop():
-    global BIG_LOT_SLOTS
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
+def detection_snapshot(boxes):
+    """Build a complete frame snapshot before publishing it to API readers."""
+    return {
+        key: "occupied" if any(overlaps(box, region) for box in boxes) else "free"
+        for key, region in SLOTS.items()
+    }
 
-        results = model(frame, conf=0.4, verbose=False)
-        boxes = results[0].boxes
 
-        # Reset all slots to free
-        for s in BIG_LOT_SLOTS:
-            BIG_LOT_SLOTS[s] = "free"
+def yolo_loop(stop):
+    global detector_status
+    cap = None
+    try:
+        import cv2
+        from ultralytics import YOLO
 
-        if boxes is not None:
-            for box, cls in zip(boxes.xyxy, boxes.cls):
-                if int(cls) == 2:  # 2 = car in COCO dataset
-                    x1, y1, x2, y2 = map(int, box)
+        model = YOLO(MODEL_PATH)
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            raise RuntimeError("Configured camera could not be opened")
+        while not stop.is_set():
+            ok, frame = cap.read()
+            if not ok:
+                detector_status = "camera_unavailable"
+                stop.wait(0.2)
+                continue
+            results = model(frame, conf=0.4, verbose=False)
+            boxes = results[0].boxes
+            cars = [] if boxes is None else [
+                tuple(map(int, box))
+                for box, cls in zip(boxes.xyxy, boxes.cls)
+                if int(cls) == 2
+            ]
+            snapshot = detection_snapshot(cars)
+            with state_lock:
+                BIG_LOT_SLOTS.update(snapshot)
+            detector_status = "running"
+            stop.wait(0.2)
+    except Exception:
+        detector_status = "error"
+        log.exception("Parking detector stopped; occupancy may be stale")
+    finally:
+        if cap is not None:
+            cap.release()
 
-                    for slot_id, region in SLOTS.items():
-                        if overlaps((x1, y1, x2, y2), region):
-                            BIG_LOT_SLOTS[slot_id] = "occupied"
 
-        time.sleep(0.2)
+@asynccontextmanager
+async def lifespan(app):
+    global detector_status
+    stop = threading.Event()
+    worker = None
+    if DETECTION_ENABLED:
+        detector_status = "starting"
+        worker = threading.Thread(target=yolo_loop, args=(stop,), daemon=True)
+        worker.start()
+    yield
+    stop.set()
+    if worker is not None:
+        worker.join(timeout=5)
 
-# -------------------- START YOLO THREAD --------------------
-threading.Thread(target=yolo_loop, daemon=True).start()
 
-# -------------------- API ROUTES --------------------
+app = FastAPI(title="Smart Parking Prototype", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+
 @app.get("/")
 def root():
-    return {"status": "YOLO Parking Backend Running"}
+    return {
+        "status": "Parking backend running",
+        "mode": "camera" if DETECTION_ENABLED else "manual-demo",
+        "detector_status": detector_status,
+    }
+
 
 @app.get("/biglot")
 def get_big_lot():
-    return {"slots": BIG_LOT_SLOTS}
+    with state_lock:
+        slots = BIG_LOT_SLOTS.copy()
+    return {"slots": slots, **root()}
+
 
 @app.post("/slot/{slot_id}/{state}")
 def set_slot(slot_id: str, state: str):
     if slot_id not in BIG_LOT_SLOTS:
         raise HTTPException(status_code=404, detail="Slot not found")
-    if state not in ["free", "occupied"]:
+    if state not in ("free", "occupied"):
         raise HTTPException(status_code=400, detail="Invalid state")
-
-    BIG_LOT_SLOTS[slot_id] = state
+    if DETECTION_ENABLED:
+        raise HTTPException(status_code=409, detail="Manual updates require manual-demo mode")
+    with state_lock:
+        BIG_LOT_SLOTS[slot_id] = state
     return {"ok": True}
